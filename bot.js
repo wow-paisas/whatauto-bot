@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const axios = require('axios');
 const pino = require('pino');
@@ -9,39 +9,34 @@ const API_URL = process.env.API_URL || 'https://inmiti.site/autoresponder/api/in
 const API_TOKEN = process.env.API_TOKEN || '';
 const PORT = process.env.PORT || 3000;
 
-if (!API_TOKEN) {
-    console.error('❌ ERROR: Falta la variable de entorno API_TOKEN');
-    process.exit(1);
-}
+if (!API_TOKEN) { console.error('❌ Falta API_TOKEN'); process.exit(1); }
 
 let qrDataUrl = null;
 let conectado = false;
+let intentos = 0;
 
-// Servidor HTTP para mostrar el QR
 const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     if (conectado) {
-        res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#0a0f0a;color:#4ade80"><h1>✅ WhatsApp Conectado</h1><p>El bot está funcionando correctamente.</p></body></html>');
+        res.end('<html><body style="background:#0a0f0a;color:#4ade80;font-family:sans-serif;text-align:center;padding:50px"><h1>✅ WhatsApp Conectado</h1><p>El bot está respondiendo mensajes automáticamente.</p></body></html>');
     } else if (qrDataUrl) {
-        res.end(`<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#0a0f0a;color:white">
-<h1>📱 Escanea este QR con WhatsApp</h1>
-<p>WhatsApp → Dispositivos vinculados → Vincular dispositivo</p>
-<img src="${qrDataUrl}" style="width:300px;height:300px;border:10px solid white;border-radius:10px"/>
-<p style="color:#aaa">El QR expira en ~60 segundos. Si expira, recarga la página.</p>
+        res.end(`<html><head><meta http-equiv="refresh" content="30"></head><body style="background:#0a0f0a;color:white;font-family:sans-serif;text-align:center;padding:30px">
+<h2>📱 Escanea con WhatsApp</h2>
+<p>WhatsApp → ⋮ → Dispositivos vinculados → Vincular dispositivo</p>
+<img src="${qrDataUrl}" style="width:280px;height:280px;border:8px solid white;border-radius:12px;margin:20px"/>
+<p style="color:#aaa;font-size:14px">La página se recarga automáticamente cada 30s</p>
 </body></html>`);
     } else {
-        res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#0a0f0a;color:white"><h1>⏳ Iniciando bot...</h1><p>Recarga en unos segundos.</p></body></html>');
+        res.end(`<html><head><meta http-equiv="refresh" content="5"></head><body style="background:#0a0f0a;color:white;font-family:sans-serif;text-align:center;padding:50px">
+<h2>⏳ Conectando con WhatsApp...</h2><p>Intento ${intentos}. Recargando en 5 segundos...</p>
+</body></html>`);
     }
 });
 server.listen(PORT, () => console.log(`🌐 Servidor QR en puerto ${PORT}`));
 
-const cooldown = new Map();
-const COOLDOWN_MS = 5000;
-
 async function consultarAPI(app, remitente, mensaje) {
     try {
-        const res = await axios.post(
-            `${API_URL}?endpoint=match`,
+        const res = await axios.post(`${API_URL}?endpoint=match`,
             { app, remitente, mensaje },
             { headers: { 'X-Api-Token': API_TOKEN }, timeout: 8000 }
         );
@@ -52,38 +47,64 @@ async function consultarAPI(app, remitente, mensaje) {
     }
 }
 
+const cooldown = new Map();
+
 async function iniciarBot() {
+    intentos++;
+    console.log(`🔄 Intento de conexión #${intentos}`);
+    
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+    
+    let version;
+    try {
+        const r = await fetchLatestBaileysVersion();
+        version = r.version;
+        console.log(`📦 Baileys versión: ${version}`);
+    } catch(e) {
+        version = [2, 3000, 1015901307];
+        console.log('⚠️ Usando versión por defecto de Baileys');
+    }
 
     const sock = makeWASocket({
         version,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true,
-        browser: ['INMITI WhataAuto', 'Chrome', '1.0'],
+        browser: ['Ubuntu', 'Chrome', '120.0.0'],
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 2000,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (qr) {
-            console.log('📱 QR generado — abre la URL del servicio en Railway para escanearlo');
-            qrDataUrl = await qrcode.toDataURL(qr);
+            console.log('📱 QR generado — abre la URL para escanear');
+            try { qrDataUrl = await qrcode.toDataURL(qr); } catch(e) {}
             conectado = false;
         }
         if (connection === 'open') {
             conectado = true;
             qrDataUrl = null;
-            console.log('✅ WhatsApp conectado');
+            intentos = 0;
+            console.log('✅ WhatsApp conectado y listo');
         }
         if (connection === 'close') {
             conectado = false;
-            const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            const reconectar = code !== DisconnectReason.loggedOut;
-            console.log(`🔌 Desconectado (${code}). Reconectar: ${reconectar}`);
-            if (reconectar) setTimeout(iniciarBot, 5000);
-            else { console.log('⛔ Sesión cerrada.'); process.exit(0); }
+            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            console.log(`🔌 Desconectado. Código: ${statusCode}`);
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('⛔ Sesión cerrada por el usuario.');
+                process.exit(0);
+            }
+            const delay = Math.min(5000 * intentos, 30000);
+            console.log(`⏳ Reconectando en ${delay/1000}s...`);
+            setTimeout(iniciarBot, delay);
         }
     });
 
@@ -91,15 +112,17 @@ async function iniciarBot() {
         if (type !== 'notify') return;
         for (const msg of messages) {
             if (msg.key.fromMe) continue;
-            if (msg.key.remoteJid.endsWith('@g.us')) continue;
+            if (msg.key.remoteJid?.endsWith('@g.us')) continue;
             if (msg.key.remoteJid === 'status@broadcast') continue;
 
-            const remitente = msg.key.remoteJid.replace('@s.whatsapp.net', '');
-            const texto = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+            const remitente = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || '';
+            const texto = msg.message?.conversation
+                || msg.message?.extendedTextMessage?.text
+                || msg.message?.imageMessage?.caption || '';
             if (!texto.trim()) continue;
 
             const ahora = Date.now();
-            if (cooldown.has(remitente) && ahora - cooldown.get(remitente) < COOLDOWN_MS) continue;
+            if (cooldown.has(remitente) && ahora - cooldown.get(remitente) < 5000) continue;
             cooldown.set(remitente, ahora);
 
             console.log(`📨 +${remitente}: "${texto.substring(0, 60)}"`);
@@ -109,13 +132,16 @@ async function iniciarBot() {
                 const delay = (resultado.delay || 0) * 1000;
                 if (delay > 0) await new Promise(r => setTimeout(r, delay));
                 await sock.sendPresenceUpdate('composing', msg.key.remoteJid);
-                await new Promise(r => setTimeout(r, 1200));
+                await new Promise(r => setTimeout(r, 1000));
                 await sock.sendPresenceUpdate('paused', msg.key.remoteJid);
                 await sock.sendMessage(msg.key.remoteJid, { text: resultado.respuesta });
-                console.log(`✉️ Respondido: "${resultado.respuesta.substring(0, 60)}"`);
+                console.log(`✉️ Respondido a +${remitente}`);
             }
         }
     });
 }
 
-iniciarBot().catch(console.error);
+iniciarBot().catch(err => {
+    console.error('❌ Error fatal:', err.message);
+    setTimeout(iniciarBot, 10000);
+});
