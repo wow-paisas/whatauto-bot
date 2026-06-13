@@ -223,6 +223,15 @@ async function restaurarSesiones() {
 //   GET  /sessions                           → lista todas las sesiones activas
 
 const server = http.createServer(async (req, res) => {
+    // CORS headers para permitir peticiones desde el navegador
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bot-Token');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204); res.end(); return;
+    }
+
     // Verificar token en todas las peticiones
     const token = req.headers['x-bot-token'] || new URL(req.url, 'http://x').searchParams.get('token');
     if (token !== BOT_TOKEN) {
